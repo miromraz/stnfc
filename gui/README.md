@@ -1,73 +1,83 @@
 # stnfc GUI
 
-A small Plasma-Mobile-friendly Qt frontend that wraps the `stnfc` CLI.
+A Plasma-Mobile-friendly GUI frontend that wraps the `stnfc` CLI.
 
-Single-file PySide6 (Qt 6) Python app. Each button spawns the `stnfc`
-binary as a subprocess and streams its output into the on-screen log.
-For UX iteration speed; can later be ported to Kirigami QML for a more
-native Plasma Mobile look.
+Two implementations live here:
 
-## Buttons
+| File | Toolkit | Status on pmOS edge (May 2026) |
+|-|-|-|
+| `stnfc_gui.py` | **GTK4 + libadwaita (PyGObject)** — default | works |
+| `stnfc_gui_qt.py` | PySide6 (Qt 6) | broken — see below |
 
-|  |  |
-|-|-|
-| Read tag (poll) | `stnfc poll` — detect a tag, print UID/SAK/RF protocol |
-| Read NDEF | `stnfc ndef-read` — parse and pretty-print NDEF |
-| Dump MIFARE 1K | `stnfc dump` — auth all 16 sectors, read 64/64 blocks |
-| Clone tag | `stnfc clone /tmp/clone.conf` — capture for replay |
-| Emulate cloned | `stnfc emulate-apdu /tmp/clone.conf` — replay the clone for 60 s |
-| Emulate URL / text | `stnfc emulate-ndef <text>` — phone becomes a Type 4 NDEF tag |
-| MIFARE write block | `stnfc write <blk> <hex>` — block-level write (safety-guarded) |
-| MIFARE copy from dump | `stnfc mfc-copy <file>` — write a dump to a fresh tag |
-| Stop running command | sends SIGTERM to the running `stnfc` subprocess |
+The PySide6 version is preserved as a fallback. pmOS edge currently
+ships `py3-pyside6` 6.11.0 built against Qt 6.11.0, but the installed
+Qt is 6.11.1 — a private-ABI version skew (`QtPrivate_6_11_0` symbol
+not found). When PySide6 is rebuilt against the installed Qt the Qt
+version will work again; until then GTK4 is the default.
 
-## Requirements (on the phone)
+## Install (on the phone)
 
-- `stnfc` binary built from `tool/stnfc.c` and copied somewhere in `$PATH`
-  (the GUI defaults to looking up `stnfc`; override via `STNFC=/path/to/stnfc`).
-- Python 3 + PySide6:
+```sh
+# the stnfc CLI -- assumes you've built and scp'd the binary
+sudo install -m 755 ./stnfc /usr/local/bin/stnfc
 
-```
-sudo apk add python3 py3-pyside6
+# passwordless sudo for stnfc only
+echo '%wheel ALL=(root) NOPASSWD: /usr/local/bin/stnfc' | \
+    sudo tee /etc/sudoers.d/stnfc
+sudo chmod 0440 /etc/sudoers.d/stnfc
+
+# the GTK GUI
+sudo install -m 755 ./gui/stnfc_gui.py /usr/local/bin/stnfc-gui
+sudo install -m 644 ./gui/io.github.miromraz.stnfc.desktop \
+    /usr/share/applications/
+
+# GTK4 / libadwaita / PyGObject (typically already present on pmOS
+# Plasma Mobile -- install only if missing):
+sudo apk add gtk4.0 libadwaita py3-gobject3
 ```
 
 ## Running
 
+From the Plasma Mobile app launcher, find **stnfc** and tap. The
+desktop entry inherits the session env (Wayland, D-Bus, etc.) so the
+window opens cleanly.
+
+To launch from SSH (e.g. for remote debugging) the env vars need to
+be set explicitly:
+
+```sh
+DBUS=$(tr '\0' '\n' < /proc/$(pgrep -f 'kwin_wayland --wayland-fd' \
+    | head -1)/environ | grep '^DBUS_SESSION_BUS_ADDRESS=' | cut -d= -f2-)
+WAYLAND_DISPLAY=wayland-0 \
+  XDG_RUNTIME_DIR=/run/user/$(id -u) \
+  GDK_BACKEND=wayland \
+  XDG_CURRENT_DESKTOP=KDE \
+  DBUS_SESSION_BUS_ADDRESS="$DBUS" \
+  /usr/local/bin/stnfc-gui
 ```
-python3 stnfc_gui.py
-```
-
-## Permissions — `stnfc` needs root
-
-`stnfc` opens `/dev/i2c-2` and `/dev/gpiochip2`, both of which are
-root-only on a stock pmOS. The GUI runs the binary via `sudo -n`
-(non-interactive) by default. Two ways to make that work:
-
-**Passwordless sudo for stnfc only** (cleanest):
-
-```
-# as root
-echo '%wheel ALL=(root) NOPASSWD: /usr/local/bin/stnfc' \
-    > /etc/sudoers.d/stnfc
-chmod 0440 /etc/sudoers.d/stnfc
-```
-
-**Setuid the binary** (simplest, less safe — only a test phone):
-
-```
-sudo chown root:root /usr/local/bin/stnfc
-sudo chmod u+s /usr/local/bin/stnfc
-# then run the GUI with sudo disabled:
-STNFC_SUDO= python3 stnfc_gui.py
-```
-
-A future improvement (better than either): a udev rule giving a non-root
-group read/write access to the two devices, then add the user to the
-group. Lives in `packaging/alpine/` once the apk is wired up.
 
 ## Environment knobs
 
 | variable | default | meaning |
 |-|-|-|
-| `STNFC` | `stnfc` | path to the `stnfc` binary |
-| `STNFC_SUDO` | `sudo` | command to escalate with (set empty to disable) |
+| `STNFC` | `/usr/local/bin/stnfc` | path to the CLI binary |
+| `STNFC_SUDO` | `sudo` | command to escalate with (set empty if `stnfc` is setuid root) |
+
+## UI layout
+
+| Section | Actions |
+|-|-|
+| Read | Detect tag · Read NDEF · Dump MIFARE Classic 1K |
+| Emulate | Inline entry: URL or text → `emulate-ndef` for 60 s |
+| Clone and replay | Clone tag to `/tmp/clone.conf` · Replay that file (60 s) |
+| Write | Inline entry: text → `write` to MIFARE block 1 |
+| Output | Live-streamed `stnfc` stdout/stderr; clear-output and stop-command buttons in the headerbar |
+
+For power-user operations (`apdu`, `mfc-copy`, `raw`, `dump > file`,
+custom blocks) drop to the CLI:
+
+```sh
+sudo stnfc apdu 90 60 00 00 00
+sudo stnfc mfc-copy /tmp/src.dump
+sudo stnfc --timeout 60000 emulate-apdu /path/to/file.conf
+```
