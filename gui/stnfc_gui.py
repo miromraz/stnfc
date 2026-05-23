@@ -2,20 +2,20 @@
 # stnfc GUI -- GTK4 + libadwaita frontend that drives the stnfc CLI.
 #
 # Built with PyGObject. Mobile-touch friendly via Adw.PreferencesGroup /
-# Adw.ActionRow. Each user action spawns the stnfc binary as a subprocess
-# (via Gio.Subprocess for async output streaming) and appends its output
-# to the on-screen log.
-#
-# Why GTK4/Adw and not Qt? pmOS edge currently ships a PySide6 6.11.0
-# built against Qt 6.11.0 while the installed Qt is 6.11.1 -- a private-
-# ABI break that crashes any PySide6 import. The QWidgets version of
-# this GUI is preserved in stnfc_gui_qt.py for when that's fixed.
+# Adw.ActionRow widgets, with a four-tab layout (Read / Write / Emulate /
+# Tools) navigated via Adw.ViewSwitcherBar. A persistent output panel
+# at the bottom streams stnfc stdout live across all tabs.
 #
 # Permissions: stnfc needs root for /dev/i2c-2 and /dev/gpiochip2. The
-# GUI invokes it via `sudo -n` by default (set up /etc/sudoers.d/stnfc
-# with NOPASSWD). Environment overrides:
-#   STNFC       path to the stnfc binary    (default /usr/local/bin/stnfc)
-#   STNFC_SUDO  command to escalate with    (default 'sudo'; empty = none)
+# GUI invokes it via `sudo -n` (set up /etc/sudoers.d/stnfc with
+# NOPASSWD). Environment overrides:
+#   STNFC       path to the stnfc binary (default /usr/local/bin/stnfc)
+#   STNFC_SUDO  command to escalate with (default 'sudo'; empty = none)
+#
+# Why GTK4/Adw and not Qt? pmOS edge currently ships py3-pyside6 6.11.0
+# built against Qt 6.11.0, but the installed Qt is 6.11.1 -- private-ABI
+# version skew that crashes every PySide6 import. The QWidgets port is
+# preserved in stnfc_gui_qt.py for when Alpine's rebuild lands.
 
 import os
 import sys
@@ -36,13 +36,13 @@ class Window(Adw.ApplicationWindow):
         self.set_title("stnfc")
         self.proc = None
 
+        # ----- toolbar + header --------------------------------------
         toolbar = Adw.ToolbarView()
         self.set_content(toolbar)
 
         header = Adw.HeaderBar()
-        title = Adw.WindowTitle(title="stnfc",
-                                subtitle="NFC toolkit for sunfish")
-        header.set_title_widget(title)
+        header.set_title_widget(Adw.WindowTitle(
+            title="stnfc", subtitle="NFC toolkit for sunfish"))
         toolbar.add_top_bar(header)
 
         self.stop_btn = Gtk.Button.new_from_icon_name("process-stop-symbolic")
@@ -50,117 +50,172 @@ class Window(Adw.ApplicationWindow):
         self.stop_btn.set_sensitive(False)
         self.stop_btn.connect("clicked", self.on_stop)
         header.pack_end(self.stop_btn)
-
-        clear_btn = Gtk.Button.new_from_icon_name(
-            "edit-clear-all-symbolic")
+        clear_btn = Gtk.Button.new_from_icon_name("edit-clear-all-symbolic")
         clear_btn.set_tooltip_text("Clear output")
         clear_btn.connect("clicked", self.on_clear)
         header.pack_end(clear_btn)
 
-        scroll = Gtk.ScrolledWindow(vexpand=True)
-        toolbar.set_content(scroll)
+        # ----- main vertical: ViewStack on top, output below ---------
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        toolbar.set_content(main)
 
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                        margin_top=12, margin_bottom=12,
-                        margin_start=12, margin_end=12)
-        scroll.set_child(outer)
+        self.stack = Adw.ViewStack()
+        self.stack.set_vexpand(True)
+        main.append(self.stack)
 
-        # -------- READ group --------------------------------------------
-        g_read = Adw.PreferencesGroup(title="Read")
-        outer.append(g_read)
-        self._add_action(g_read, "Detect tag",
-                         "Print UID, tag type, RF protocol",
-                         ["poll"])
-        self._add_action(g_read, "Read NDEF",
-                         "Parse the NDEF message from a Type 2 / Type 4 tag",
-                         ["ndef-read"])
-        self._add_action(g_read, "Dump MIFARE Classic 1K",
-                         "Auth all 16 sectors with key A FF×6, read 64 blocks",
-                         ["dump"])
+        self.stack.add_titled_with_icon(self._build_read_page(),
+            "read", "Read", "edit-find-symbolic")
+        self.stack.add_titled_with_icon(self._build_write_page(),
+            "write", "Write", "document-edit-symbolic")
+        self.stack.add_titled_with_icon(self._build_emulate_page(),
+            "emulate", "Emulate", "send-to-symbolic")
+        self.stack.add_titled_with_icon(self._build_tools_page(),
+            "tools", "Tools", "applications-utilities-symbolic")
 
-        # -------- EMULATE group -----------------------------------------
-        g_emu = Adw.PreferencesGroup(title="Emulate")
-        outer.append(g_emu)
-        self.url_row = Adw.EntryRow(title="URL or text — phone becomes an NFC tag")
-        self.url_row.set_show_apply_button(True)
-        self.url_row.connect("apply", self.on_emit_url)
-        g_emu.add(self.url_row)
-
-        # -------- WI-FI SHARING group -----------------------------------
-        g_wifi = Adw.PreferencesGroup(title="Share Wi-Fi",
-            description="Phone becomes a tag carrying Wi-Fi credentials")
-        outer.append(g_wifi)
-        self.wifi_ssid = Adw.EntryRow(title="SSID")
-        g_wifi.add(self.wifi_ssid)
-        self.wifi_psk = Adw.PasswordEntryRow(title="Password (leave empty = open)")
-        g_wifi.add(self.wifi_psk)
-        wifi_btn_row = Adw.ActionRow(title="Emulate Wi-Fi tag",
-            subtitle="Receiver phone joins on tap (60 s window)",
-            activatable=True)
-        wifi_btn_row.add_suffix(Gtk.Image.new_from_icon_name("network-wireless-symbolic"))
-        wifi_btn_row.connect("activated", self.on_emit_wifi)
-        g_wifi.add(wifi_btn_row)
-
-        # -------- CLONE / REPLAY group ----------------------------------
-        g_cln = Adw.PreferencesGroup(title="Clone and replay",
-            description="Capture a tag, then replay it from this phone")
-        outer.append(g_cln)
-        self._add_action(g_cln, "Clone tag",
-                         "Read everything readable, save to /tmp/clone.conf",
-                         ["clone", "/tmp/clone.conf"])
-        self._add_action(g_cln, "Emulate cloned tag (60 s)",
-                         "Replay /tmp/clone.conf — tap a reader to test",
-                         ["--timeout", "60000",
-                          "emulate-apdu", "/tmp/clone.conf"])
-
-        # -------- WRITE group -------------------------------------------
-        g_wr = Adw.PreferencesGroup(title="Write",
-            description="MIFARE Classic block write — block 0 and sector trailers are guarded")
-        outer.append(g_wr)
-        self.write_row = Adw.EntryRow(title="Text to write to block 1")
-        self.write_row.set_show_apply_button(True)
-        self.write_row.connect("apply", self.on_write_block1)
-        g_wr.add(self.write_row)
-
-        # -------- OUTPUT ------------------------------------------------
-        outlbl = Gtk.Label(label="<b>Output</b>",
-                           use_markup=True, halign=Gtk.Align.START,
-                           margin_top=8)
-        outer.append(outlbl)
+        # output (shared across tabs)
+        out_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                          margin_top=4, margin_bottom=4,
+                          margin_start=8, margin_end=8)
+        out_lbl = Gtk.Label(label="<b>Output</b>", use_markup=True,
+                            halign=Gtk.Align.START)
+        out_box.append(out_lbl)
         self.tv_out = Gtk.TextView(editable=False, cursor_visible=False,
                                     monospace=True)
         self.tv_out.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        out_scroll = Gtk.ScrolledWindow(min_content_height=260)
-        out_scroll.add_css_class("card")
-        out_scroll.set_child(self.tv_out)
-        outer.append(out_scroll)
+        self._out_scroll = Gtk.ScrolledWindow(min_content_height=180)
+        self._out_scroll.add_css_class("card")
+        self._out_scroll.set_child(self.tv_out)
+        out_box.append(self._out_scroll)
+        main.append(out_box)
         self.buffer = self.tv_out.get_buffer()
-        self._out_scroll = out_scroll
 
-        self.append(
-            "Ready. stnfc binary: " + STNFC + "\n"
-            "Tap an action above. The phone needs to be unlocked and a\n"
-            "compatible NFC tag (or another NFC device) near the upper-\n"
-            "center of the back during read/clone/emulate operations.\n"
-        )
+        # ----- bottom view switcher (Adwaita "tabbar") ---------------
+        switcher = Adw.ViewSwitcherBar()
+        switcher.set_stack(self.stack)
+        switcher.set_reveal(True)
+        toolbar.add_bottom_bar(switcher)
 
-    # ------ widget helpers ---------------------------------------------
+        self.append("Ready.  CLI: " + STNFC + "\n"
+                    "Pick a tab and tap an action.  Tag operations need\n"
+                    "the tag near the upper-center of the phone's back.\n")
 
-    def _add_action(self, group, title, subtitle, args):
+    # ===== page builders ============================================
+
+    def _scroll_box(self):
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                      margin_top=12, margin_bottom=12,
+                      margin_start=12, margin_end=12)
+        scroll.set_child(box)
+        return scroll, box
+
+    def _action(self, group, title, subtitle, args, icon="go-next-symbolic"):
         row = Adw.ActionRow(title=title, subtitle=subtitle, activatable=True)
-        row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+        row.add_suffix(Gtk.Image.new_from_icon_name(icon))
         row.connect("activated", lambda *_: self.run(args))
         group.add(row)
         return row
+
+    def _build_read_page(self):
+        scroll, box = self._scroll_box()
+        g = Adw.PreferencesGroup(title="Detect")
+        box.append(g)
+        self._action(g, "Poll for tag",
+            "Print UID, tag type, RF protocol", ["poll"])
+        self._action(g, "Read NDEF",
+            "Parse NDEF from Type 2 / Type 4 tag", ["ndef-read"])
+
+        g2 = Adw.PreferencesGroup(title="MIFARE Classic")
+        box.append(g2)
+        self._action(g2, "Dump 1K",
+            "Auth all 16 sectors (key A FF*6) and read 64 blocks",
+            ["dump"])
+        return scroll
+
+    def _build_write_page(self):
+        scroll, box = self._scroll_box()
+        g = Adw.PreferencesGroup(title="MIFARE Classic — block write",
+            description="Block 0 (UID) and sector trailers are guarded")
+        box.append(g)
+        self.write_row = Adw.EntryRow(title="Text to write to block 1 (up to 16 chars)")
+        self.write_row.set_show_apply_button(True)
+        self.write_row.connect("apply", self.on_write_block1)
+        g.add(self.write_row)
+
+        g2 = Adw.PreferencesGroup(title="NDEF write (Type 2 / NTAG)",
+            description="Write a URL or text NDEF record to a Type 2 tag")
+        box.append(g2)
+        self.ndef_write_row = Adw.EntryRow(title="URL or text")
+        self.ndef_write_row.set_show_apply_button(True)
+        self.ndef_write_row.connect("apply", self.on_ndef_write)
+        g2.add(self.ndef_write_row)
+        return scroll
+
+    def _build_emulate_page(self):
+        scroll, box = self._scroll_box()
+
+        g_url = Adw.PreferencesGroup(title="URL or text tag")
+        box.append(g_url)
+        self.url_row = Adw.EntryRow(
+            title="URL (https://, tel:, mailto:, geo:) or plain text")
+        self.url_row.set_show_apply_button(True)
+        self.url_row.connect("apply", self.on_emit_url)
+        g_url.add(self.url_row)
+
+        g_wifi = Adw.PreferencesGroup(title="Wi-Fi sharing",
+            description="Tap a receiver phone — it auto-joins the named network")
+        box.append(g_wifi)
+        self.wifi_ssid = Adw.EntryRow(title="SSID")
+        g_wifi.add(self.wifi_ssid)
+        self.wifi_psk = Adw.PasswordEntryRow(title="Password (empty = open)")
+        g_wifi.add(self.wifi_psk)
+        wifi_emit = Adw.ActionRow(title="Emulate Wi-Fi tag (60 s)",
+            activatable=True)
+        wifi_emit.add_suffix(Gtk.Image.new_from_icon_name(
+            "network-wireless-symbolic"))
+        wifi_emit.connect("activated", self.on_emit_wifi)
+        g_wifi.add(wifi_emit)
+        return scroll
+
+    def _build_tools_page(self):
+        scroll, box = self._scroll_box()
+
+        g = Adw.PreferencesGroup(title="Clone and replay",
+            description="Capture a tag, then replay it from this phone")
+        box.append(g)
+        self._action(g, "Clone tag",
+            "Read everything readable, save to /tmp/clone.conf",
+            ["clone", "/tmp/clone.conf"],
+            icon="edit-copy-symbolic")
+        self._action(g, "Emulate cloned tag (60 s)",
+            "Replay /tmp/clone.conf as a Type 4 tag",
+            ["--timeout", "60000", "emulate-apdu", "/tmp/clone.conf"],
+            icon="media-playback-start-symbolic")
+
+        g_mfc = Adw.PreferencesGroup(title="MIFARE clone-to-tag")
+        box.append(g_mfc)
+        self._action(g_mfc, "Copy /tmp/clone.conf to current tag",
+            "Writes a MIFARE dump to the tag (skips block 0 and trailers)",
+            ["mfc-copy", "/tmp/clone.conf"],
+            icon="document-save-symbolic")
+
+        g_diag = Adw.PreferencesGroup(title="Diagnostics")
+        box.append(g_diag)
+        self._action(g_diag, "Chip info",
+            "List gpiochips, identify TLMM, show CLI config",
+            ["info"])
+        self._action(g_diag, "NCI handshake",
+            "Reset + CORE_RESET + CORE_INIT, print chip identity",
+            ["nci"])
+        return scroll
+
+    # ===== output / subprocess plumbing =============================
 
     def append(self, text):
         end = self.buffer.get_end_iter()
         self.buffer.insert(end, text)
         adj = self._out_scroll.get_vadjustment()
-        # Defer scroll until layout settles so it actually moves.
         GLib.idle_add(lambda: adj.set_value(adj.get_upper()) or False)
-
-    # ------ subprocess driver ------------------------------------------
 
     def run(self, args):
         if self.proc:
@@ -192,9 +247,9 @@ class Window(Adw.ApplicationWindow):
         except GLib.Error:
             line = None
         if line is None:
-            rc = -1
+            rc = "?"
             try:
-                rc = self.proc.get_exit_status() if self.proc else -1
+                rc = self.proc.get_exit_status() if self.proc else "?"
             except Exception:
                 pass
             self.append("[stnfc exit " + str(rc) + "]\n")
@@ -204,7 +259,7 @@ class Window(Adw.ApplicationWindow):
         self.append(line + "\n")
         self._read_next(stream)
 
-    # ------ actions ----------------------------------------------------
+    # ===== actions ==================================================
 
     def on_stop(self, _btn):
         if self.proc:
@@ -241,6 +296,12 @@ class Window(Adw.ApplicationWindow):
         hex_args = ["%02X" % b for b in data]
         self.run(["write", "1"] + hex_args)
         row.set_text("")
+
+    def on_ndef_write(self, row):
+        text = row.get_text().strip()
+        if text:
+            self.run(["ndef-write", text])
+            row.set_text("")
 
 
 class App(Adw.Application):
