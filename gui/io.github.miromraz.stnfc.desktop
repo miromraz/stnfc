@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=stnfc
+GenericName=NFC toolkit
+Comment=Read, write, clone and emulate NFC tags on sunfish
+Exec=stnfc-gui
+Icon=preferences-system-bluetooth
+Terminal=false
+Categories=Utility;System;
+StartupNotify=true
+X-Purism-FormFactor=Workstation;Mobile;

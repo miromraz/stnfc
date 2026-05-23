@@ -4,6 +4,10 @@
 *.a
 build/
 
+# python
+__pycache__/
+*.pyc
+
 # editor / OS noise
 *.swp
 *~
