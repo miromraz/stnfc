@@ -1,0 +1,14 @@
+# build artifacts
+/stnfc
+*.o
+*.a
+build/
+
+# editor / OS noise
+*.swp
+*~
+.DS_Store
+
+# local scratch
+/tmp/
+*.local.conf
