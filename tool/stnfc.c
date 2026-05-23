@@ -88,6 +88,8 @@ static int  g_inv_reset    = 0;      /* 0: high = chip ON (active-high)     */
 static int  g_inv_irq      = 0;      /* 0: high = data ready                */
 static int  g_no_reset     = 0;
 static int  g_timeout      = 1000;   /* ms to wait for IRQ per read         */
+static uint8_t g_la_nfcid1[10];      /* listen-mode NFCID1 (UID) spoof      */
+static int  g_la_nfcid1_len = 0;     /* 0 = use chip default; 4/7/10 = spoof */
 
 /* ---- small helpers ----------------------------------------------------- */
 static void msleep(int ms){ struct timespec t={ms/1000,(long)(ms%1000)*1000000L}; nanosleep(&t,0); }
@@ -904,9 +906,29 @@ static void build_ndef_wifi(const char *ssid, const char *psk, int wpa2){
     t4t_ndef_len = rn;
 }
 
+/* Apply --la-nfcid1 if set: send NCI CORE_SET_CONFIG TLV 0x33 (LA_NFCID1)
+ * so the chip presents the given UID in NFC-A listen mode. Whether the
+ * chip honors it is firmware-specific. */
+static void apply_la_nfcid1(int i2cfd, int irqfd){
+    if(g_la_nfcid1_len == 0) return;
+    uint8_t cmd[24]; int n = 0;
+    cmd[n++] = 0x20; cmd[n++] = 0x02;                   /* CORE_SET_CONFIG */
+    cmd[n++] = (uint8_t)(1 + 2 + g_la_nfcid1_len);      /* payload length */
+    cmd[n++] = 0x01;                                    /* 1 TLV */
+    cmd[n++] = 0x33;                                    /* LA_NFCID1 */
+    cmd[n++] = (uint8_t)g_la_nfcid1_len;
+    memcpy(cmd + n, g_la_nfcid1, g_la_nfcid1_len);
+    n += g_la_nfcid1_len;
+    printf("-- LA_NFCID1 spoof = ");
+    for(int i = 0; i < g_la_nfcid1_len; i++) printf("%02X ", g_la_nfcid1[i]);
+    printf("--\n");
+    nci_cmd(i2cfd, irqfd, "CORE_SET_CONFIG (LA_NFCID1)", cmd, n, 200);
+}
+
 /* Shared listen-mode loop: serves t4t_ndef contents to readers as a
  * Type 4 tag, via the t4t_apdu state machine. */
 static int emulate_t4_listen(int i2cfd, int irqfd, const char *banner){
+    apply_la_nfcid1(i2cfd, irqfd);
     nci_cmd(i2cfd, irqfd, "RF_DISCOVER_MAP (ISO-DEP listen)",
             rfmap_listen_iso, sizeof rfmap_listen_iso, 200);
     uint8_t disc[] = { 0x21, 0x03, 0x03,  0x01,  0x80, 0x01 };
@@ -1374,23 +1396,73 @@ static const char *sw_name(int sw1, int sw2){
     return "unknown SW";
 }
 
+/* Send one APDU and pretty-print the response. `n` is the APDU index for
+ * logging in multi-APDU chains. Returns 0 on success (any SW). */
+static int apdu_send_print(int i2cfd, int irqfd, int n,
+                            const uint8_t *apdu, int alen){
+    printf("\n-- C-APDU #%d (%d bytes) --\n  ->", n, alen);
+    for(int j = 0; j < alen; j++) printf(" %02x", apdu[j]);
+    printf("\n");
+    uint8_t resp[300]; int rlen;
+    if(t4t_send_apdu_raw(i2cfd, irqfd, apdu, alen, resp, &rlen) < 0){
+        printf("  <- transceive failed (RF link torn down?)\n");
+        return -1;
+    }
+    int sw1 = resp[rlen - 2], sw2 = resp[rlen - 1];
+    int dlen = rlen - 2;
+    printf("-- R-APDU #%d (%d byte%s) --\n", n, rlen, rlen==1?"":"s");
+    if(dlen > 0){
+        printf("  <- data (%d):", dlen);
+        for(int j = 0; j < dlen && j < 80; j++) printf(" %02x", resp[j]);
+        if(dlen > 80) printf(" ...");
+        printf("\n     ascii: ");
+        for(int j = 0; j < dlen && j < 80; j++)
+            putchar(resp[j] >= 0x20 && resp[j] < 0x7F ? resp[j] : '.');
+        printf("\n");
+    }
+    printf("  <- SW=%02X%02X   (%s)\n", sw1, sw2, sw_name(sw1, sw2));
+    return 0;
+}
+
 static int do_apdu(int argc, char **argv){
     if(argc < 4){
         fprintf(stderr,
-            "usage: stnfc apdu HH HH HH HH [...]   (at least CLA INS P1 P2)\n"
-            "  example -- PSE SELECT on an EMV bank card:\n"
-            "  stnfc apdu 00 A4 04 00 0E 31 50 41 59 2E 53 59 53 2E 44 44 46 30 31 00\n");
+            "usage: stnfc apdu HH HH HH HH [...] [ ';' HH HH ... ] ...\n"
+            "  Sends one or more APDUs in a single ISO-DEP activation.\n"
+            "  Separate multiple APDUs with the literal token ';'.\n"
+            "  Example -- DESFire select-app + authenticate in one session:\n"
+            "  stnfc apdu 90 5A 00 00 03 D0 02 F4 00 ';' 90 AA 00 00 01 00 00\n");
         return 1;
     }
-    uint8_t apdu[260]; int alen = 0;
-    for(int j = 0; j < argc && alen < 260; j++){
+    /* Parse APDUs separated by ';' tokens into a list. */
+    #define MAX_APDUS 16
+    uint8_t apdus[MAX_APDUS][260]; int alens[MAX_APDUS]; int an = 0;
+    int cur = 0;
+    for(int j = 0; j < argc; j++){
+        if(strcmp(argv[j], ";") == 0){
+            if(cur > 0){
+                alens[an++] = cur; cur = 0;
+                if(an >= MAX_APDUS){
+                    fprintf(stderr,"too many APDUs (max %d)\n", MAX_APDUS);
+                    return 1;
+                }
+            }
+            continue;
+        }
         char *end;
         long v = strtol(argv[j], &end, 16);
         if(*end != 0 || v < 0 || v > 255){
-            fprintf(stderr,"invalid hex byte at position %d: %s\n", j, argv[j]);
+            fprintf(stderr,"invalid hex at position %d: %s\n", j, argv[j]);
             return 1;
         }
-        apdu[alen++] = (uint8_t)v;
+        if(cur >= 260){
+            fprintf(stderr,"APDU too long at position %d\n", j); return 1;
+        }
+        apdus[an][cur++] = (uint8_t)v;
+    }
+    if(cur > 0){ alens[an++] = cur; }
+    if(an == 0){
+        fprintf(stderr,"no APDUs given\n"); return 1;
     }
 
     int i2cfd, irqfd;
@@ -1403,37 +1475,16 @@ static int do_apdu(int argc, char **argv){
     if(g_rf_proto != 0x04){
         printf("RESULT: tag is not ISO-DEP (RF proto 0x%02x) -- APDU needs Type 4.\n",
                g_rf_proto);
-        rf_deactivate(i2cfd, irqfd);
-        return 5;
+        rf_deactivate(i2cfd, irqfd); return 5;
     }
 
-    printf("\n-- C-APDU (%d bytes) --\n  ->", alen);
-    for(int j = 0; j < alen; j++) printf(" %02x", apdu[j]);
-    printf("\n");
-
-    uint8_t resp[300]; int rlen;
-    if(t4t_send_apdu_raw(i2cfd, irqfd, apdu, alen, resp, &rlen) < 0){
-        printf("RESULT: APDU transceive failed (RF link torn down?).\n");
-        rf_deactivate(i2cfd, irqfd);
-        return 6;
+    for(int j = 0; j < an; j++){
+        if(apdu_send_print(i2cfd, irqfd, j+1, apdus[j], alens[j]) < 0){
+            printf("RESULT: chain aborted at APDU #%d (link torn down).\n", j+1);
+            rf_deactivate(i2cfd, irqfd);
+            return 6;
+        }
     }
-
-    int sw1 = resp[rlen - 2], sw2 = resp[rlen - 1];
-    int dlen = rlen - 2;
-    printf("\n-- R-APDU (%d byte%s) --\n", rlen, rlen==1?"":"s");
-    if(dlen > 0){
-        printf("  <- data (%d):", dlen);
-        for(int j = 0; j < dlen && j < 80; j++) printf(" %02x", resp[j]);
-        if(dlen > 80) printf(" ...");
-        printf("\n");
-        /* Also print ASCII for the printable bytes -- handy for AIDs / labels. */
-        printf("     ascii: ");
-        for(int j = 0; j < dlen && j < 80; j++)
-            putchar(resp[j] >= 0x20 && resp[j] < 0x7F ? resp[j] : '.');
-        printf("\n");
-    }
-    printf("  <- SW=%02X%02X   (%s)\n", sw1, sw2, sw_name(sw1, sw2));
-
     rf_deactivate(i2cfd, irqfd);
     return 0;
 }
@@ -2134,6 +2185,27 @@ int main(int argc,char **argv){
         else if(!strcmp(argv[i],"--inv-reset"))       g_inv_reset=1;
         else if(!strcmp(argv[i],"--inv-irq"))         g_inv_irq=1;
         else if(!strcmp(argv[i],"--no-reset"))        g_no_reset=1;
+        else if(!strcmp(argv[i],"--la-nfcid1") && i+1<argc){
+            /* Parse hex bytes (space, colon, or contiguous). */
+            const char *s = argv[++i];
+            g_la_nfcid1_len = 0;
+            while(*s && g_la_nfcid1_len < 10){
+                while(*s == ' ' || *s == ':' || *s == '\t') s++;
+                if(!*s) break;
+                int hi = HEX_NIBBLE(s[0]);
+                int lo = (s[1] ? HEX_NIBBLE(s[1]) : -1);
+                if(hi < 0 || lo < 0){
+                    fprintf(stderr,"bad hex in --la-nfcid1\n"); return 1;
+                }
+                g_la_nfcid1[g_la_nfcid1_len++] = (uint8_t)((hi<<4)|lo);
+                s += 2;
+            }
+            if(g_la_nfcid1_len != 4 && g_la_nfcid1_len != 7 && g_la_nfcid1_len != 10){
+                fprintf(stderr,"--la-nfcid1 needs 4, 7, or 10 bytes (got %d)\n",
+                        g_la_nfcid1_len);
+                return 1;
+            }
+        }
         else { fprintf(stderr,"unknown flag %s\n",argv[i]); return 1; }
     }
     if(i>=argc){
