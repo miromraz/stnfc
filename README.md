@@ -25,6 +25,7 @@ userspace path is fleshed out.
 | `ndef-read` | partial — Type 2 + Type 4 dispatch + Type 4 APDU flow proven |
 | `ndef-write <text>` | shipped — Type 2 NTAG write (no NTAG handy to verify) |
 | `emulate-ndef [url\|text]` | yes — Type 4 NDEF tag emulation, end-to-end with another phone |
+| `emulate-wifi <SSID> [psk] [OPEN]` | NDEF Wi-Fi Simple Configuration tag — receiver phone auto-joins on tap |
 | `emulate-apdu <conf>` | yes — programmable HCE, 24 APDUs handled across 8 reader taps |
 | `clone <out>` | yes (Type 4 + MIFARE dump paths) |
 

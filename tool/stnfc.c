@@ -28,6 +28,10 @@
  *                   reset + NCI init + listen-mode discovery + Type 4 NDEF
  *                   tag emulation (phone shows up as an NFC tag containing
  *                   the given URL or text; default is the project repo URL)
+ *   emulate-wifi <SSID> [password] [OPEN]
+ *                   emulate an NFC Wi-Fi-config tag (WFA WSC Credential
+ *                   in a Type 4 NDEF MIME record). Tap a receiver phone
+ *                   to auto-join the named network.
  *   emulate-apdu <conf>
  *                   reset + NCI init + listen-mode + programmable HCE.
  *                   Lines in <conf> map APDU patterns to responses:
@@ -819,37 +823,78 @@ static int t4t_apdu(const uint8_t *a, int n, uint8_t *r){
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int s){ (void)s; g_stop = 1; }
 
-static int do_emulate_ndef(int argc, char **argv){
-    const char *payload = (argc >= 1)
-        ? argv[0]
-        : "https://github.com/miromraz/pmaports-sunfish";
+/* Build a WFA WSC Wi-Fi NDEF record into t4t_ndef (with NLEN prefix). */
+static void build_ndef_wifi(const char *ssid, const char *psk, int wpa2){
+    int slen = (int)strlen(ssid);
+    int plen = (int)strlen(psk);
 
-    build_ndef(payload);
-    int msglen = t4t_ndef_len - 2;
-    printf("NDEF payload: \"%s\"  (%d bytes)\n", payload, msglen);
+    /* WFA WSC Credential inner TLVs */
+    uint8_t inner[256]; int n = 0;
+    /* Network Index */
+    inner[n++]=0x10; inner[n++]=0x26; inner[n++]=0x00; inner[n++]=0x01;
+    inner[n++]=0x01;
+    /* SSID */
+    inner[n++]=0x10; inner[n++]=0x45;
+    inner[n++]=(uint8_t)(slen>>8); inner[n++]=(uint8_t)(slen&0xFF);
+    memcpy(inner+n, ssid, slen); n += slen;
+    /* Auth Type */
+    int auth = !plen ? 0x0001 : (wpa2 ? 0x0020 : 0x0002);
+    inner[n++]=0x10; inner[n++]=0x03; inner[n++]=0x00; inner[n++]=0x02;
+    inner[n++]=(uint8_t)(auth>>8); inner[n++]=(uint8_t)(auth&0xFF);
+    /* Encryption Type */
+    int enc = !plen ? 0x0001 : 0x0008;
+    inner[n++]=0x10; inner[n++]=0x0F; inner[n++]=0x00; inner[n++]=0x02;
+    inner[n++]=(uint8_t)(enc>>8); inner[n++]=(uint8_t)(enc&0xFF);
+    /* Network Key */
+    inner[n++]=0x10; inner[n++]=0x27;
+    inner[n++]=(uint8_t)(plen>>8); inner[n++]=(uint8_t)(plen&0xFF);
+    if(plen){ memcpy(inner+n, psk, plen); n += plen; }
+    /* MAC Address - broadcast */
+    inner[n++]=0x10; inner[n++]=0x20; inner[n++]=0x00; inner[n++]=0x06;
+    inner[n++]=0xFF; inner[n++]=0xFF; inner[n++]=0xFF;
+    inner[n++]=0xFF; inner[n++]=0xFF; inner[n++]=0xFF;
 
-    int i2cfd, irqfd;
-    if(prep(&i2cfd, &irqfd) < 0) return 1;
-    if(nci_chip_init(i2cfd, irqfd) < 0) return 3;
+    /* Wrap as a Credential TLV */
+    uint8_t cred[300]; int c = 0;
+    cred[c++]=0x10; cred[c++]=0x0E;
+    cred[c++]=(uint8_t)(n>>8); cred[c++]=(uint8_t)(n&0xFF);
+    memcpy(cred+c, inner, n); c += n;
 
+    /* NDEF record: TNF=MIME (0x02), type "application/vnd.wfa.wsc" */
+    static const char mime[] = "application/vnd.wfa.wsc";
+    int mlen = (int)sizeof mime - 1;
+    uint8_t *out = t4t_ndef;
+    int rn = 2;                       /* leave 2 bytes for NLEN */
+    out[rn++] = 0xD2;                 /* MB|ME|SR|TNF=2 */
+    out[rn++] = (uint8_t)mlen;        /* type length */
+    out[rn++] = (uint8_t)c;           /* payload length (SR) */
+    memcpy(out+rn, mime, mlen); rn += mlen;
+    memcpy(out+rn, cred, c); rn += c;
+
+    int msglen = rn - 2;
+    out[0] = (uint8_t)(msglen >> 8);
+    out[1] = (uint8_t)(msglen & 0xFF);
+    t4t_ndef_len = rn;
+}
+
+/* Shared listen-mode loop: serves t4t_ndef contents to readers as a
+ * Type 4 tag, via the t4t_apdu state machine. */
+static int emulate_t4_listen(int i2cfd, int irqfd, const char *banner){
     nci_cmd(i2cfd, irqfd, "RF_DISCOVER_MAP (ISO-DEP listen)",
             rfmap_listen_iso, sizeof rfmap_listen_iso, 200);
-
-    /* RF_DISCOVER: NFC-A passive listen (0x80) */
     uint8_t disc[] = { 0x21, 0x03, 0x03,  0x01,  0x80, 0x01 };
     nci_cmd(i2cfd, irqfd, "RF_DISCOVER (NFC-A passive listen)",
             disc, sizeof disc, 200);
 
     int deadline = g_timeout < 5000 ? 30000 : g_timeout;
-    printf("\n*** Emulating an NFC Forum Type 4 NDEF tag ***\n");
-    printf("    Tap a reader (another phone with NFC) to the BACK of this phone.\n");
-    printf("    Window: %d ms (use --timeout <ms> to extend). Ctrl+C to stop early.\n\n",
+    printf("\n*** %s ***\n", banner);
+    printf("    Tap a reader to the BACK of the phone.\n");
+    printf("    Window: %d ms (use --timeout <ms> to extend). Ctrl+C to stop.\n\n",
            deadline);
 
     signal(SIGINT, on_sigint);
-    int activated = 0;
-    int taps = 0;
-    int elapsed = 0;
+    g_stop = 0;
+    int activated = 0, taps = 0, elapsed = 0;
     uint8_t buf[300], resp[300];
 
     while(!g_stop && elapsed < deadline){
@@ -858,18 +903,17 @@ static int do_emulate_ndef(int argc, char **argv){
         if(n < 0)  { elapsed += 50;  continue; }
         nci_decode(buf, n);
 
-        if(buf[0] == 0x61 && buf[1] == 0x05){            /* RF_INTF_ACTIVATED_NTF */
+        if(buf[0] == 0x61 && buf[1] == 0x05){
             activated = 1;
             t4t_state = T4T_NONE;
             taps++;
             printf("\n--- reader detected (tap #%d) ---\n", taps);
-        } else if(buf[0] == 0x61 && buf[1] == 0x06){     /* RF_DEACTIVATE_NTF */
+        } else if(buf[0] == 0x61 && buf[1] == 0x06){
             if(activated){
                 printf("--- reader left field ---\n\n");
                 activated = 0;
             }
         } else if((buf[0] & 0xE0) == 0x00 && n >= 3 && activated){
-            /* DATA packet from the chip -- an APDU from the reader */
             int plen = buf[2];
             int rlen = t4t_apdu(buf + 3, plen, resp);
             uint8_t pkt[3 + 260];
@@ -880,6 +924,52 @@ static int do_emulate_ndef(int argc, char **argv){
     }
 
     printf("\nstopping... (%d reader tap(s) handled)\n", taps);
+    return taps;
+}
+
+static int do_emulate_ndef(int argc, char **argv){
+    const char *payload = (argc >= 1)
+        ? argv[0]
+        : "https://github.com/miromraz/pmaports-sunfish";
+    build_ndef(payload);
+    printf("NDEF payload: \"%s\"  (%d bytes)\n", payload, t4t_ndef_len - 2);
+
+    int i2cfd, irqfd;
+    if(prep(&i2cfd, &irqfd) < 0) return 1;
+    if(nci_chip_init(i2cfd, irqfd) < 0) return 3;
+    char banner[200];
+    snprintf(banner, sizeof banner, "Emulating Type 4 NDEF tag");
+    int taps = emulate_t4_listen(i2cfd, irqfd, banner);
+    rf_deactivate(i2cfd, irqfd);
+    return taps > 0 ? 0 : 4;
+}
+
+static int do_emulate_wifi(int argc, char **argv){
+    if(argc < 1){
+        fprintf(stderr,
+            "usage: stnfc emulate-wifi <SSID> [password] [OPEN]\n"
+            "  Phone shows up as an NFC Wi-Fi-config tag; a receiver phone\n"
+            "  joins the named network on tap. Open networks need no\n"
+            "  password (or pass OPEN explicitly).\n");
+        return 1;
+    }
+    const char *ssid = argv[0];
+    const char *psk = (argc >= 2) ? argv[1] : "";
+    int open = (argc >= 3 && strcasecmp(argv[2], "OPEN") == 0) || !psk[0];
+    if(open) psk = "";
+
+    build_ndef_wifi(ssid, psk, !open);
+    printf("Wi-Fi NDEF: SSID=\"%s\", security=%s, payload=%d bytes\n",
+           ssid, open ? "open" : "WPA2-PSK", t4t_ndef_len - 2);
+
+    int i2cfd, irqfd;
+    if(prep(&i2cfd, &irqfd) < 0) return 1;
+    if(nci_chip_init(i2cfd, irqfd) < 0) return 3;
+    char banner[200];
+    snprintf(banner, sizeof banner,
+             "Emulating Wi-Fi tag (SSID=\"%s\", %s)",
+             ssid, open ? "open" : "WPA2-PSK");
+    int taps = emulate_t4_listen(i2cfd, irqfd, banner);
     rf_deactivate(i2cfd, irqfd);
     return taps > 0 ? 0 : 4;
 }
@@ -1884,7 +1974,7 @@ int main(int argc,char **argv){
         else { fprintf(stderr,"unknown flag %s\n",argv[i]); return 1; }
     }
     if(i>=argc){
-        fprintf(stderr,"usage: stnfc [flags] info|reset|nci|poll|read|write|dump|apdu|ndef-read|ndef-write|emulate-ndef|emulate-apdu|clone|mfc-copy|drain|raw HH..\n");
+        fprintf(stderr,"usage: stnfc [flags] info|reset|nci|poll|read|write|dump|apdu|ndef-read|ndef-write|emulate-ndef|emulate-wifi|emulate-apdu|clone|mfc-copy|drain|raw HH..\n");
         return 1;
     }
     const char *cmd=argv[i++];
@@ -1899,6 +1989,7 @@ int main(int argc,char **argv){
     if(!strcmp(cmd,"ndef-read"))    return do_ndef_read();
     if(!strcmp(cmd,"ndef-write"))   return do_ndef_write(argc-i,argv+i);
     if(!strcmp(cmd,"emulate-ndef")) return do_emulate_ndef(argc-i,argv+i);
+    if(!strcmp(cmd,"emulate-wifi")) return do_emulate_wifi(argc-i,argv+i);
     if(!strcmp(cmd,"emulate-apdu")) return do_emulate_apdu(argc-i,argv+i);
     if(!strcmp(cmd,"clone"))        return do_clone(argc-i,argv+i);
     if(!strcmp(cmd,"mfc-copy"))     return do_mfc_copy(argc-i,argv+i);

@@ -86,6 +86,21 @@ class Window(Adw.ApplicationWindow):
         self.url_row.connect("apply", self.on_emit_url)
         g_emu.add(self.url_row)
 
+        # -------- WI-FI SHARING group -----------------------------------
+        g_wifi = Adw.PreferencesGroup(title="Share Wi-Fi",
+            description="Phone becomes a tag carrying Wi-Fi credentials")
+        outer.append(g_wifi)
+        self.wifi_ssid = Adw.EntryRow(title="SSID")
+        g_wifi.add(self.wifi_ssid)
+        self.wifi_psk = Adw.PasswordEntryRow(title="Password (leave empty = open)")
+        g_wifi.add(self.wifi_psk)
+        wifi_btn_row = Adw.ActionRow(title="Emulate Wi-Fi tag",
+            subtitle="Receiver phone joins on tap (60 s window)",
+            activatable=True)
+        wifi_btn_row.add_suffix(Gtk.Image.new_from_icon_name("network-wireless-symbolic"))
+        wifi_btn_row.connect("activated", self.on_emit_wifi)
+        g_wifi.add(wifi_btn_row)
+
         # -------- CLONE / REPLAY group ----------------------------------
         g_cln = Adw.PreferencesGroup(title="Clone and replay",
             description="Capture a tag, then replay it from this phone")
@@ -204,6 +219,19 @@ class Window(Adw.ApplicationWindow):
         if text:
             self.run(["--timeout", "60000", "emulate-ndef", text])
             row.set_text("")
+
+    def on_emit_wifi(self, _row):
+        ssid = self.wifi_ssid.get_text().strip()
+        if not ssid:
+            self.append("[wifi: SSID is required]\n")
+            return
+        psk = self.wifi_psk.get_text()
+        args = ["--timeout", "60000", "emulate-wifi", ssid]
+        if psk:
+            args.append(psk)
+        else:
+            args.extend(["", "OPEN"])
+        self.run(args)
 
     def on_write_block1(self, row):
         text = row.get_text()
