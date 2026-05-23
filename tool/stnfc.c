@@ -37,6 +37,13 @@
  *                   and write an `emulate-apdu`-ready config (NDEF tags)
  *                   or a hex dump (MIFARE Classic, which the chip cannot
  *                   listen-emulate). Replay with `emulate-apdu <out>`.
+ *   mfc-copy [--write-trailers] <dump-file>
+ *                   read a MIFARE Classic 1K dump (from `clone`) and
+ *                   write it to the tag currently on the phone. Block 0
+ *                   (UID/manufacturer) is always skipped (read-only on
+ *                   standard MIFARE Classic). Sector trailers are skipped
+ *                   by default -- they hold keys+access bits and writing
+ *                   bad values bricks the sector.
  *   drain           reset + just read whatever the chip emits
  *   raw HH HH ...   reset + send one NCI packet, read replies
  *
@@ -1715,6 +1722,138 @@ static int do_clone(int argc, char **argv){
     return 6;
 }
 
+/* ---- mfc-copy: write a MIFARE Classic 1K dump to the current tag ----- */
+
+/* Parse a "# block NN: HH HH ... HH" line. Returns block number, -1 if no
+ * match; writes 16 bytes into `out` on a match. */
+static int parse_mfc_dump_line(const char *line, uint8_t *out){
+    const char *p = line;
+    while(*p == ' ' || *p == '\t') p++;
+    if(*p != '#') return -1;
+    p++;
+    while(*p == ' ' || *p == '\t') p++;
+    if(strncmp(p, "block", 5) != 0) return -1;
+    p += 5;
+    while(*p == ' ' || *p == '\t') p++;
+    char *end;
+    long blk = strtol(p, &end, 10);
+    if(end == p || *end != ':') return -1;
+    p = end + 1;
+    int n = 0;
+    while(*p && n < 16){
+        while(*p == ' ' || *p == '\t') p++;
+        if(*p == '\n' || *p == '\r' || *p == 0) break;
+        int hi = HEX_NIBBLE(p[0]);
+        int lo = HEX_NIBBLE(p[1]);
+        if(hi < 0 || lo < 0) return -1;
+        out[n++] = (uint8_t)((hi << 4) | lo);
+        p += 2;
+    }
+    if(n != 16) return -1;
+    return (int)blk;
+}
+
+static int do_mfc_copy(int argc, char **argv){
+    int write_trailers = 0, i;
+    for(i = 0; i < argc; i++){
+        if(strcmp(argv[i], "--write-trailers") == 0) write_trailers = 1;
+        else break;
+    }
+    if(i >= argc){
+        fprintf(stderr,
+            "usage: stnfc mfc-copy [--write-trailers] <dump-file>\n"
+            "  Writes a MIFARE Classic 1K dump (from `stnfc clone`) to\n"
+            "  the tag currently on the phone. Block 0 (UID) is always\n"
+            "  skipped (read-only on standard MIFARE Classic). Sector\n"
+            "  trailers (blocks 3,7,11,...) are skipped unless\n"
+            "  --write-trailers is given -- bad trailer writes can\n"
+            "  permanently lock the sector.\n");
+        return 1;
+    }
+    const char *path = argv[i];
+    FILE *f = fopen(path, "r");
+    if(!f){
+        fprintf(stderr,"cannot open %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    uint8_t blocks[64][16];
+    int have[64] = {0};
+    char line[512];
+    while(fgets(line, sizeof line, f)){
+        uint8_t buf[16];
+        int blk = parse_mfc_dump_line(line, buf);
+        if(blk >= 0 && blk < 64){
+            memcpy(blocks[blk], buf, 16);
+            have[blk] = 1;
+        }
+    }
+    fclose(f);
+    int loaded = 0;
+    for(int b = 0; b < 64; b++) if(have[b]) loaded++;
+    printf("Loaded %d/64 blocks from %s\n", loaded, path);
+    if(loaded == 0){
+        fprintf(stderr,"no '# block N: ...' lines parsed from dump\n");
+        return 1;
+    }
+
+    int i2cfd, irqfd;
+    if(prep(&i2cfd, &irqfd) < 0) return 1;
+    if(nci_full_init(i2cfd, irqfd) < 0) return 3;
+    if(!rf_discover_wait(i2cfd, irqfd)){
+        rf_deactivate(i2cfd, irqfd);
+        printf("RESULT: no destination tag detected.\n"); return 4;
+    }
+    if(g_sak != 0x08){
+        printf("RESULT: destination is not MIFARE Classic 1K (SAK 0x%02x).\n",
+               g_sak);
+        rf_deactivate(i2cfd, irqfd); return 5;
+    }
+    printf("Destination UID:");
+    for(int j = 0; j < g_uidlen; j++) printf(" %02x", g_uid[j]);
+    printf("  SAK 0x%02x\n\n", g_sak);
+
+    int written = 0, skipped = 0, failed = 0;
+    int cur_sector = -1;
+    for(int b = 0; b < 64; b++){
+        if(!have[b]){ continue; }
+        if(b == 0){
+            printf("  block  0 : skip (manufacturer/UID, read-only)\n");
+            skipped++; continue;
+        }
+        if((b % 4) == 3 && !write_trailers){
+            printf("  block %2d : skip (sector trailer; use --write-trailers to force)\n", b);
+            skipped++; continue;
+        }
+        if(b / 4 != cur_sector){
+            if(mfc_auth(i2cfd, irqfd, (b / 4) * 4) < 0){
+                printf("  sector %d : auth FAILED -- destination uses non-default keys\n",
+                       b / 4);
+                int s = b / 4;
+                while(b < 64 && b / 4 == s){ failed++; b++; }
+                b--;
+                if(!rf_discover_wait(i2cfd, irqfd)) break;
+                cur_sector = -1;
+                continue;
+            }
+            cur_sector = b / 4;
+        }
+        if(mfc_write(i2cfd, irqfd, b, blocks[b]) < 0){
+            failed++; continue;
+        }
+        uint8_t verif[16];
+        if(mfc_read(i2cfd, irqfd, b, verif) != 0 ||
+           memcmp(verif, blocks[b], 16) != 0){
+            printf("  block %2d : VERIFY FAILED\n", b);
+            failed++; continue;
+        }
+        written++;
+    }
+    rf_deactivate(i2cfd, irqfd);
+    printf("\nRESULT: wrote %d block(s), skipped %d (block 0 / trailers / "
+           "missing-from-dump), failed %d.\n", written, skipped, failed);
+    return written > 0 ? 0 : 6;
+}
+
 static int do_raw(int argc,char **argv){
     uint8_t cmd[260]; int len=0;
     for(int i=0;i<argc && len<260;i++) cmd[len++]=(uint8_t)strtol(argv[i],0,16);
@@ -1745,7 +1884,7 @@ int main(int argc,char **argv){
         else { fprintf(stderr,"unknown flag %s\n",argv[i]); return 1; }
     }
     if(i>=argc){
-        fprintf(stderr,"usage: stnfc [flags] info|reset|nci|poll|read|write|dump|apdu|ndef-read|ndef-write|emulate-ndef|emulate-apdu|clone|drain|raw HH..\n");
+        fprintf(stderr,"usage: stnfc [flags] info|reset|nci|poll|read|write|dump|apdu|ndef-read|ndef-write|emulate-ndef|emulate-apdu|clone|mfc-copy|drain|raw HH..\n");
         return 1;
     }
     const char *cmd=argv[i++];
@@ -1762,6 +1901,7 @@ int main(int argc,char **argv){
     if(!strcmp(cmd,"emulate-ndef")) return do_emulate_ndef(argc-i,argv+i);
     if(!strcmp(cmd,"emulate-apdu")) return do_emulate_apdu(argc-i,argv+i);
     if(!strcmp(cmd,"clone"))        return do_clone(argc-i,argv+i);
+    if(!strcmp(cmd,"mfc-copy"))     return do_mfc_copy(argc-i,argv+i);
     if(!strcmp(cmd,"drain")) return do_drain();
     if(!strcmp(cmd,"raw"))   return do_raw(argc-i,argv+i);
     fprintf(stderr,"unknown subcommand %s\n",cmd);
