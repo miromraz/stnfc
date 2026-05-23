@@ -1,0 +1,47 @@
+# Maintainer: miromraz <noreply@example.com>
+pkgname=stnfc
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="Userspace NFC toolkit for the Google Pixel 4a's ST21NFC contactless front-end"
+url="https://github.com/miromraz/stnfc"
+arch="aarch64"
+license="GPL-2.0-or-later"
+depends="
+	py3-gobject3
+	gtk4.0
+	libadwaita
+"
+makedepends="musl-dev linux-headers"
+options="!check"
+source="
+	stnfc.c
+	stnfc_gui.py
+	io.github.miromraz.stnfc.desktop
+"
+builddir="$srcdir"
+
+build() {
+	cd "$srcdir"
+	${CC:-gcc} ${CFLAGS:--O2} -Wall -o stnfc stnfc.c
+}
+
+package() {
+	cd "$srcdir"
+
+	install -Dm755 stnfc "$pkgdir"/usr/bin/stnfc
+	install -Dm755 stnfc_gui.py "$pkgdir"/usr/bin/stnfc-gui
+	install -Dm644 io.github.miromraz.stnfc.desktop \
+		"$pkgdir"/usr/share/applications/io.github.miromraz.stnfc.desktop
+
+	install -dm755 "$pkgdir"/etc/sudoers.d
+	cat > "$pkgdir"/etc/sudoers.d/stnfc <<-'SUDO'
+		%wheel ALL=(root) NOPASSWD: /usr/bin/stnfc
+	SUDO
+	chmod 0440 "$pkgdir"/etc/sudoers.d/stnfc
+}
+
+sha512sums="
+ff186efe04479aefb6eff55cb102081bb40ea0b1617dcaee7b50a63870ca89633132bc49bc323eb934f14e749ae795d8ff4ba78abcff1be080deeb5de8f9bed7  stnfc.c
+7320e416824448b44ea2c155a9cb3b0e26f98257880d272b611ec68b8636afbb5ff4b546dc62a1d275872ce405a7dd66da478bde33c24337b642c482180c8193  stnfc_gui.py
+e35e9395e6a1c783920fe955f70b30ea9bb953ddc4062a74eb681509486952b50acd35501fde3145a67ee48567fb1c22b884b82c9b74d64a798423d117cbf3b6  io.github.miromraz.stnfc.desktop
+"

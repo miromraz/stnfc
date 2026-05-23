@@ -25,7 +25,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk
 
-STNFC = os.environ.get("STNFC", "/usr/local/bin/stnfc")
+STNFC = os.environ.get("STNFC", "/usr/bin/stnfc")
 SUDO = os.environ.get("STNFC_SUDO", "sudo")
 
 
@@ -179,6 +179,21 @@ class Window(Adw.ApplicationWindow):
         wifi_emit.connect("activated", self.on_emit_wifi)
         g_wifi.add(wifi_emit)
 
+        g_spoof = Adw.PreferencesGroup(title="Spoof a card's UID",
+            description="Sets LA_NFCID1 — phone presents the given UID on the air. "
+                        "Works on UID-only readers (cheap access control, hotel doors); "
+                        "won't beat readers that do DESFire/AES auth.")
+        box.append(g_spoof)
+        self.spoof_uid = Adw.EntryRow(title="UID (4, 7, or 10 hex bytes — e.g. 04:55:27:F2:90:6F:80)")
+        g_spoof.add(self.spoof_uid)
+        spoof_emit = Adw.ActionRow(title="Emulate as that UID (60 s)",
+            subtitle="Tap the target reader during the listen window",
+            activatable=True)
+        spoof_emit.add_suffix(Gtk.Image.new_from_icon_name(
+            "smartcard-symbolic"))
+        spoof_emit.connect("activated", self.on_emit_spoof)
+        g_spoof.add(spoof_emit)
+
         g_vc = Adw.PreferencesGroup(title="Contact / vCard",
             description="Receiver phone offers to add a new contact")
         box.append(g_vc)
@@ -317,6 +332,25 @@ class Window(Adw.ApplicationWindow):
         phone = self.vc_phone.get_text().strip()
         email = self.vc_email.get_text().strip()
         self.run(["--timeout", "60000", "emulate-vcard", name, phone, email])
+
+    def on_emit_spoof(self, _row):
+        uid = self.spoof_uid.get_text().strip()
+        # accept "04:55:27:..." or "04 55 27 ..." or "0455 27F2 906F 80"
+        cleaned = uid.replace(":", "").replace(" ", "")
+        if len(cleaned) not in (8, 14, 20):
+            self.append("[spoof: UID must be 4, 7, or 10 hex bytes "
+                        "(got %d hex chars)]\n" % len(cleaned))
+            return
+        try:
+            int(cleaned, 16)
+        except ValueError:
+            self.append("[spoof: invalid hex in UID]\n")
+            return
+        # pass through as a colon-separated string for clarity in the log
+        formatted = ":".join(cleaned[i:i+2] for i in range(0, len(cleaned), 2))
+        self.run(["--la-nfcid1", formatted,
+                  "--timeout", "60000",
+                  "emulate-ndef", "stnfc-uid-spoof"])
 
     def on_write_block1(self, row):
         text = row.get_text()
