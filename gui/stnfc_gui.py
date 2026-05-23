@@ -130,6 +130,9 @@ class Window(Adw.ApplicationWindow):
         self._action(g2, "Dump 1K",
             "Auth all 16 sectors (key A FF*6) and read 64 blocks",
             ["dump"])
+        self._action(g2, "Key dictionary attack",
+            "Try built-in common keys (factory, NDEF MAD, transit, hotel)",
+            ["keys"])
         return scroll
 
     def _build_write_page(self):

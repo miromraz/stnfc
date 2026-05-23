@@ -15,6 +15,8 @@
  *   read [blk cnt]  poll + MIFARE Classic auth (key A FF*6) + block read
  *   write blk [hex] MIFARE Classic auth + write a data block + verify
  *   dump            full MIFARE Classic 1K dump (16 sectors * 4 blocks, key A FF*6)
+ *   keys            MIFARE Classic key-A dictionary attack against the
+ *                   current tag using a built-in list of common defaults
  *   apdu HH HH ...  detect an ISO-DEP card and send a single APDU, print
  *                   response data + SW1 SW2 with a short status decode
  *                   (e.g. apdu 00 A4 04 00 0E 31 50 41 59 2E 53 59 53 2E
@@ -516,24 +518,46 @@ static int data_xfer(int i2cfd,int irqfd,const uint8_t *tx,int txlen,
     return 0;
 }
 
-/* authenticate the sector containing `block`, key A = FF*6.
+/* authenticate the sector containing `block` with a given 6-byte key A.
  * ST frame format (from ST-authored AOSP rw_mfc.cc): 60|block|UID(4)|key(6).
- * Success = a 1-byte DATA reply with status 0x00. */
-static int mfc_auth(int i2cfd,int irqfd,int block){
+ * Success = a 1-byte DATA reply with status 0x00. `verbose` controls the
+ * "-- MIFARE AUTH ..." progress lines (the dictionary attack runs quiet). */
+static int mfc_auth_with_key(int i2cfd, int irqfd, int block,
+                              const uint8_t key[6], int verbose){
     uint8_t pl[16]; int n=0;
-    pl[n++]=0x60; pl[n++]=(uint8_t)block;                 /* AUTH key A, block */
+    pl[n++]=0x60; pl[n++]=(uint8_t)block;
     int ul=g_uidlen?g_uidlen:4;
-    memcpy(pl+n,g_uid,ul); n+=ul;                         /* UID first */
-    for(int i=0;i<6;i++) pl[n++]=0xFF;                    /* then key A = FF*6 */
+    memcpy(pl+n,g_uid,ul); n+=ul;
+    memcpy(pl+n,key,6); n+=6;
     uint8_t pkt[24]; pkt[0]=0x00; pkt[1]=0x00; pkt[2]=(uint8_t)n;
     memcpy(pkt+3,pl,n);
-    printf("-- MIFARE AUTH sector %d (block %d) key A FF*6 --\n",block/4,block);
+    if(verbose){
+        printf("-- MIFARE AUTH sector %d (block %d) key A ",block/4,block);
+        for(int i=0;i<6;i++) printf("%02X",key[i]);
+        printf(" --\n");
+    }
     uint8_t rx[300]; int rxlen,deact;
     data_xfer(i2cfd,irqfd,pkt,3+n,rx,&rxlen,&deact);
-    if(deact){ printf("   AUTH failed -- RF link torn down.\n"); return -1; }
-    if(rxlen>=1 && rx[0]==0x00){ printf("   AUTH OK (status 00).\n"); return 0; }
-    if(rxlen>=1){ printf("   AUTH failed -- status 0x%02x.\n",rx[0]); return -1; }
-    printf("   AUTH: no response.\n"); return -1;
+    if(deact){
+        if(verbose) printf("   AUTH failed -- RF link torn down.\n");
+        return -1;
+    }
+    if(rxlen>=1 && rx[0]==0x00){
+        if(verbose) printf("   AUTH OK (status 00).\n");
+        return 0;
+    }
+    if(rxlen>=1){
+        if(verbose) printf("   AUTH failed -- status 0x%02x.\n",rx[0]);
+        return -1;
+    }
+    if(verbose) printf("   AUTH: no response.\n");
+    return -1;
+}
+
+/* Convenience wrapper: authenticate with factory-default key A FF*6. */
+static int mfc_auth(int i2cfd, int irqfd, int block){
+    static const uint8_t k[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    return mfc_auth_with_key(i2cfd, irqfd, block, k, /*verbose*/1);
 }
 
 /* read one 16-byte block; if out16 != NULL, copy the block data there */
@@ -1879,6 +1903,78 @@ static int do_clone(int argc, char **argv){
     return 6;
 }
 
+/* ---- mfc-keys: dictionary attack against the current tag's sectors --- */
+
+static const uint8_t mfc_default_keys[][6] = {
+    {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF}, /* factory default */
+    {0x00,0x00,0x00,0x00,0x00,0x00}, /* blank */
+    {0xA0,0xA1,0xA2,0xA3,0xA4,0xA5}, /* NDEF MAD public key */
+    {0xD3,0xF7,0xD3,0xF7,0xD3,0xF7}, /* NDEF data key A */
+    {0xB0,0xB1,0xB2,0xB3,0xB4,0xB5}, /* transit / common */
+    {0x4D,0x3A,0x99,0xC3,0x51,0xDD}, /* hotel-card variant */
+    {0x1A,0x98,0x2C,0x7E,0x45,0x9A}, /* transport variant */
+    {0xAA,0xBB,0xCC,0xDD,0xEE,0xFF}, /* very common test */
+    {0x14,0x28,0x32,0x14,0x28,0x32}, /* common */
+    {0x56,0x33,0x7B,0x9C,0x86,0x87}, /* common */
+    {0x6B,0xBE,0xE6,0x46,0xEB,0x0E}, /* transit */
+    {0x71,0xF3,0xA3,0x15,0xAD,0x26}, /* transit */
+    {0xF1,0xD8,0x3F,0x96,0x4D,0xE3}, /* hotel */
+    {0x44,0x4D,0x49,0x46,0x41,0x52}, /* "DMIFAR" ASCII */
+};
+#define MFC_N_DEFAULT_KEYS \
+    ((int)(sizeof mfc_default_keys / sizeof mfc_default_keys[0]))
+
+static int do_keys(int argc, char **argv){
+    (void)argc; (void)argv;
+
+    int i2cfd, irqfd;
+    if(prep(&i2cfd, &irqfd) < 0) return 1;
+    if(nci_full_init(i2cfd, irqfd) < 0) return 3;
+    if(!rf_discover_wait(i2cfd, irqfd)){
+        rf_deactivate(i2cfd, irqfd);
+        printf("RESULT: no tag detected.\n"); return 4;
+    }
+    if(g_sak != 0x08){
+        printf("RESULT: SAK 0x%02x is not MIFARE Classic 1K.\n", g_sak);
+        rf_deactivate(i2cfd, irqfd); return 5;
+    }
+    printf("Trying %d built-in default keys against 16 sectors...\n\n",
+           MFC_N_DEFAULT_KEYS);
+
+    int sectors_open = 0;
+    for(int s = 0; s < 16; s++){
+        int hit = -1;
+        for(int k = 0; k < MFC_N_DEFAULT_KEYS; k++){
+            if(mfc_auth_with_key(i2cfd, irqfd, s * 4,
+                                  mfc_default_keys[k], /*verbose*/0) == 0){
+                hit = k; break;
+            }
+            /* Failed auth tears down the RF link -- re-activate. */
+            if(!rf_discover_wait(i2cfd, irqfd)){ hit = -2; break; }
+        }
+        if(hit >= 0){
+            printf("  sector %2d : key A = ", s);
+            for(int i = 0; i < 6; i++)
+                printf("%02X ", mfc_default_keys[hit][i]);
+            printf(" (dict entry %d)\n", hit);
+            sectors_open++;
+        } else if(hit == -2){
+            printf("  sector %2d : no re-activation; aborting\n", s);
+            break;
+        } else {
+            printf("  sector %2d : NO MATCH in built-in dictionary\n", s);
+        }
+    }
+    rf_deactivate(i2cfd, irqfd);
+    printf("\nRESULT: opened %d/16 sectors with built-in dictionary.\n",
+           sectors_open);
+    if(sectors_open < 16){
+        printf("        (sectors with custom keys need a real dictionary file --\n"
+               "         feed common-key DBs from MFOC / mfcuk-like tools).\n");
+    }
+    return sectors_open > 0 ? 0 : 6;
+}
+
 /* ---- mfc-copy: write a MIFARE Classic 1K dump to the current tag ----- */
 
 /* Parse a "# block NN: HH HH ... HH" line. Returns block number, -1 if no
@@ -2041,7 +2137,7 @@ int main(int argc,char **argv){
         else { fprintf(stderr,"unknown flag %s\n",argv[i]); return 1; }
     }
     if(i>=argc){
-        fprintf(stderr,"usage: stnfc [flags] info|reset|nci|poll|read|write|dump|apdu|ndef-read|ndef-write|emulate-ndef|emulate-wifi|emulate-apdu|clone|mfc-copy|drain|raw HH..\n");
+        fprintf(stderr,"usage: stnfc [flags] info|reset|nci|poll|read|write|dump|keys|apdu|ndef-read|ndef-write|emulate-ndef|emulate-wifi|emulate-vcard|emulate-apdu|clone|mfc-copy|drain|raw HH..\n");
         return 1;
     }
     const char *cmd=argv[i++];
@@ -2052,6 +2148,7 @@ int main(int argc,char **argv){
     if(!strcmp(cmd,"read"))  return do_read(argc-i,argv+i);
     if(!strcmp(cmd,"write")) return do_write(argc-i,argv+i);
     if(!strcmp(cmd,"dump"))  return do_dump();
+    if(!strcmp(cmd,"keys"))  return do_keys(argc-i,argv+i);
     if(!strcmp(cmd,"apdu"))  return do_apdu(argc-i,argv+i);
     if(!strcmp(cmd,"ndef-read"))    return do_ndef_read();
     if(!strcmp(cmd,"ndef-write"))   return do_ndef_write(argc-i,argv+i);
