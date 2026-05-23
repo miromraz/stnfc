@@ -32,6 +32,9 @@
  *                   emulate an NFC Wi-Fi-config tag (WFA WSC Credential
  *                   in a Type 4 NDEF MIME record). Tap a receiver phone
  *                   to auto-join the named network.
+ *   emulate-vcard <name> [phone] [email]
+ *                   emulate a vCard 3.0 NDEF tag (MIME text/vcard). The
+ *                   receiver phone offers to add a new contact.
  *   emulate-apdu <conf>
  *                   reset + NCI init + listen-mode + programmable HCE.
  *                   Lines in <conf> map APDU patterns to responses:
@@ -939,6 +942,70 @@ static int do_emulate_ndef(int argc, char **argv){
     if(nci_chip_init(i2cfd, irqfd) < 0) return 3;
     char banner[200];
     snprintf(banner, sizeof banner, "Emulating Type 4 NDEF tag");
+    int taps = emulate_t4_listen(i2cfd, irqfd, banner);
+    rf_deactivate(i2cfd, irqfd);
+    return taps > 0 ? 0 : 4;
+}
+
+/* Build a vCard 3.0 NDEF MIME record into t4t_ndef (with NLEN prefix). */
+static void build_ndef_vcard(const char *name, const char *phone,
+                              const char *email){
+    char body[600];
+    int bn = snprintf(body, sizeof body,
+        "BEGIN:VCARD\r\n"
+        "VERSION:3.0\r\n"
+        "FN:%s\r\n", name);
+    if(phone && phone[0])
+        bn += snprintf(body + bn, sizeof body - bn, "TEL:%s\r\n", phone);
+    if(email && email[0])
+        bn += snprintf(body + bn, sizeof body - bn, "EMAIL:%s\r\n", email);
+    bn += snprintf(body + bn, sizeof body - bn, "END:VCARD\r\n");
+    if(bn < 0 || bn >= (int)sizeof body) bn = (int)sizeof body - 1;
+
+    static const char mime[] = "text/vcard";
+    int mlen = (int)sizeof mime - 1;
+    uint8_t *out = t4t_ndef;
+    int rn = 2;                              /* NLEN prefix */
+    if(bn < 256){
+        out[rn++] = 0xD2;                    /* MB|ME|SR|TNF=2 */
+        out[rn++] = (uint8_t)mlen;
+        out[rn++] = (uint8_t)bn;
+    } else {                                 /* long-record form */
+        out[rn++] = 0xC2;
+        out[rn++] = (uint8_t)mlen;
+        out[rn++] = 0; out[rn++] = 0;
+        out[rn++] = (uint8_t)(bn >> 8);
+        out[rn++] = (uint8_t)(bn & 0xFF);
+    }
+    memcpy(out + rn, mime, mlen); rn += mlen;
+    memcpy(out + rn, body, bn);   rn += bn;
+
+    int msglen = rn - 2;
+    out[0] = (uint8_t)(msglen >> 8);
+    out[1] = (uint8_t)(msglen & 0xFF);
+    t4t_ndef_len = rn;
+}
+
+static int do_emulate_vcard(int argc, char **argv){
+    if(argc < 1){
+        fprintf(stderr,
+            "usage: stnfc emulate-vcard <name> [phone] [email]\n"
+            "  Phone shows up as an NFC vCard tag; receiver offers to add\n"
+            "  the contact. Use quotes around the name if it contains spaces.\n");
+        return 1;
+    }
+    const char *name  = argv[0];
+    const char *phone = (argc >= 2) ? argv[1] : "";
+    const char *email = (argc >= 3) ? argv[2] : "";
+    build_ndef_vcard(name, phone, email);
+    printf("vCard NDEF: FN=\"%s\"  TEL=\"%s\"  EMAIL=\"%s\"  (%d bytes)\n",
+           name, phone, email, t4t_ndef_len - 2);
+
+    int i2cfd, irqfd;
+    if(prep(&i2cfd, &irqfd) < 0) return 1;
+    if(nci_chip_init(i2cfd, irqfd) < 0) return 3;
+    char banner[200];
+    snprintf(banner, sizeof banner, "Emulating vCard tag (FN=\"%s\")", name);
     int taps = emulate_t4_listen(i2cfd, irqfd, banner);
     rf_deactivate(i2cfd, irqfd);
     return taps > 0 ? 0 : 4;
@@ -1988,9 +2055,10 @@ int main(int argc,char **argv){
     if(!strcmp(cmd,"apdu"))  return do_apdu(argc-i,argv+i);
     if(!strcmp(cmd,"ndef-read"))    return do_ndef_read();
     if(!strcmp(cmd,"ndef-write"))   return do_ndef_write(argc-i,argv+i);
-    if(!strcmp(cmd,"emulate-ndef")) return do_emulate_ndef(argc-i,argv+i);
-    if(!strcmp(cmd,"emulate-wifi")) return do_emulate_wifi(argc-i,argv+i);
-    if(!strcmp(cmd,"emulate-apdu")) return do_emulate_apdu(argc-i,argv+i);
+    if(!strcmp(cmd,"emulate-ndef"))  return do_emulate_ndef(argc-i,argv+i);
+    if(!strcmp(cmd,"emulate-wifi"))  return do_emulate_wifi(argc-i,argv+i);
+    if(!strcmp(cmd,"emulate-vcard")) return do_emulate_vcard(argc-i,argv+i);
+    if(!strcmp(cmd,"emulate-apdu"))  return do_emulate_apdu(argc-i,argv+i);
     if(!strcmp(cmd,"clone"))        return do_clone(argc-i,argv+i);
     if(!strcmp(cmd,"mfc-copy"))     return do_mfc_copy(argc-i,argv+i);
     if(!strcmp(cmd,"drain")) return do_drain();

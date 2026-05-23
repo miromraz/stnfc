@@ -175,6 +175,24 @@ class Window(Adw.ApplicationWindow):
             "network-wireless-symbolic"))
         wifi_emit.connect("activated", self.on_emit_wifi)
         g_wifi.add(wifi_emit)
+
+        g_vc = Adw.PreferencesGroup(title="Contact / vCard",
+            description="Receiver phone offers to add a new contact")
+        box.append(g_vc)
+        self.vc_name = Adw.EntryRow(title="Full name")
+        g_vc.add(self.vc_name)
+        self.vc_phone = Adw.EntryRow(title="Phone (optional)")
+        self.vc_phone.set_input_purpose(Gtk.InputPurpose.PHONE)
+        g_vc.add(self.vc_phone)
+        self.vc_email = Adw.EntryRow(title="Email (optional)")
+        self.vc_email.set_input_purpose(Gtk.InputPurpose.EMAIL)
+        g_vc.add(self.vc_email)
+        vc_emit = Adw.ActionRow(title="Emulate vCard tag (60 s)",
+            activatable=True)
+        vc_emit.add_suffix(Gtk.Image.new_from_icon_name(
+            "contact-new-symbolic"))
+        vc_emit.connect("activated", self.on_emit_vcard)
+        g_vc.add(vc_emit)
         return scroll
 
     def _build_tools_page(self):
@@ -287,6 +305,15 @@ class Window(Adw.ApplicationWindow):
         else:
             args.extend(["", "OPEN"])
         self.run(args)
+
+    def on_emit_vcard(self, _row):
+        name = self.vc_name.get_text().strip()
+        if not name:
+            self.append("[vcard: name is required]\n")
+            return
+        phone = self.vc_phone.get_text().strip()
+        email = self.vc_email.get_text().strip()
+        self.run(["--timeout", "60000", "emulate-vcard", name, phone, email])
 
     def on_write_block1(self, row):
         text = row.get_text()
