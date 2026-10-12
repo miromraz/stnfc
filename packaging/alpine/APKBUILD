@@ -5,7 +5,7 @@ pkgrel=0
 pkgdesc="Userspace NFC toolkit for the Google Pixel 4a's ST21NFC contactless front-end"
 url="https://github.com/miromraz/stnfc"
 arch="aarch64"
-license="GPL-2.0-or-later"
+license="GPL-3.0-or-later"
 depends="
 	py3-gobject3
 	gtk4.0
