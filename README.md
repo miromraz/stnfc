@@ -86,3 +86,7 @@ ssh user@<phone> 'sudo /tmp/stnfc poll'
 For the achievable subset (tag read/write, NDEF read/write, ISO-DEP
 APDU transceive, Type 4 NDEF tag emulation, programmable HCE), see the
 feature table at the top of this README.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
